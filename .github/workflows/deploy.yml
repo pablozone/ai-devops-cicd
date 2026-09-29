@@ -1,0 +1,137 @@
+# CI/CD dla quotes-api (dzień 1, lab02): lint -> testy -> build/push do ECR -> deploy na EKS.
+# Dzień 1 wdraża zwykły Deployment/Service z app/k8s-dzien1/, bez Argo Rollouts
+# (Rollout wchodzi w dniu 2 — patrz app/k8s/).
+name: CI/CD quotes-api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: quotes-api
+  EKS_CLUSTER: szkolenie-ai-devops
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Tylko odczyt kodu z repo — brak potrzeby zapisu czy dostępu do AWS.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements-dev.txt
+
+      - run: pip install -r app/requirements-dev.txt
+      - run: ruff check app/
+
+  test:
+    name: Testy (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Jak w jobie lint — same testy jednostkowe, bez dostępu do AWS ani zapisu do repo.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements-dev.txt
+
+      - run: pip install -r app/requirements-dev.txt
+      - run: cd app && pytest -q
+
+  build:
+    name: Build i push obrazu do ECR
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      image: ${{ steps.image.outputs.full }}
+    # id-token:write — token OIDC joba jest wymieniany na rolę AWS (sts:AssumeRoleWithWebIdentity),
+    #   żeby zalogować się do ECR bez długoterminowych kluczy.
+    # contents:read — tylko checkout kodu do zbudowania obrazu, bez zapisu do repo.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnij do AWS przez OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Zaloguj się do ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Zbuduj i wypchnij obraz (tag = SHA commita)
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: app/Dockerfile
+          push: true
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Zapisz pełny adres obrazu dla joba deploy
+        id: image
+        run: echo "full=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy na EKS
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # id-token:write — jak w jobie build: rola AWS przez OIDC daje dostęp do klastra EKS
+    #   (aws eks update-kubeconfig + kubectl uwierzytelniają się tą samą rolą).
+    # contents:read — tylko odczyt manifestów z app/k8s-dzien1/, bez zapisu do repo.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnij do AWS przez OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Skonfiguruj dostęp do klastra EKS
+        run: aws eks update-kubeconfig --name "${{ env.EKS_CLUSTER }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Podstaw obraz zbudowany w jobie build
+        run: sed "s#PODMIEN_NA_OBRAZ#${{ needs.build.outputs.image }}#" app/k8s-dzien1/deployment.yaml > /tmp/deployment.yaml
+
+      - name: Zastosuj manifesty w namespace uczestnika
+        run: |
+          kubectl apply -n "${{ vars.K8S_NAMESPACE }}" -f /tmp/deployment.yaml
+          kubectl apply -n "${{ vars.K8S_NAMESPACE }}" -f app/k8s-dzien1/service.yaml
+
+      - name: Czekaj, aż Deployment będzie gotowy
+        run: kubectl rollout status deployment/quotes-api-d1 -n "${{ vars.K8S_NAMESPACE }}" --timeout=180s
