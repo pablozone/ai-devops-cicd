@@ -6,6 +6,10 @@ locals {
   prefix = "szkolenie-lab01-${var.uczestnik}"
 }
 
+data "aws_vpc" "kolektor" {
+  id = var.vpc_id
+}
+
 resource "aws_s3_bucket" "logi" {
   bucket = "${local.prefix}-logs"
 
@@ -22,6 +26,19 @@ resource "aws_s3_bucket_versioning" "logi" {
 
   versioning_configuration {
     status = "Enabled"
+  }
+}
+
+# Błąd 1: brakowało jawnego szyfrowania. Bucket miał wersjonowanie i blokadę
+# dostępu publicznego, ale nie SSE — moduł referencyjny (infra/modules/app-storage)
+# i CLAUDE.md wymagają tego wprost dla każdego bucketu S3.
+resource "aws_s3_bucket_server_side_encryption_configuration" "logi" {
+  bucket = aws_s3_bucket.logi.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
   }
 }
 
@@ -58,12 +75,16 @@ resource "aws_iam_role_policy" "kolektor" {
   name = "${local.prefix}-write-logs"
   role = aws_iam_role.kolektor.id
 
+  # Błąd 3: Resource był zahardkodowany na bucket uczestnika "anna-k".
+  # Działało to tylko u autora — u każdego innego uczestnika (np. piotr-w)
+  # rola nie miałaby dostępu do WŁASNEGO bucketu, bo ARN by się nie zgadzał.
+  # Odwołanie do zasobu utworzonego wyżej w tym samym pliku jest portowalne.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
       Action   = ["s3:PutObject", "s3:GetObject"]
-      Resource = "arn:aws:s3:::szkolenie-lab01-anna-k-logs/*"
+      Resource = "${aws_s3_bucket.logi.arn}/*"
     }]
   })
 }
@@ -73,12 +94,16 @@ resource "aws_security_group" "kolektor" {
   description = "Kolektor logow"
   vpc_id      = var.vpc_id
 
+  # Błąd 2: opis mówi "sieć wewnętrzna", ale cidr_blocks wpuszczał cały internet.
+  # Ani Trivy (AVD-AWS-0107 reaguje tylko na porty 22/3389), ani Checkov tego nie
+  # zgłaszają dla portu 514 — to błąd widoczny tylko przy czytaniu, nie w skanerze.
+  # Zawężone do CIDR-u VPC, w której działa kolektor, więc opis i reguła są spójne.
   ingress {
     description = "Syslog z sieci wewnetrznej"
     from_port   = 514
     to_port     = 514
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [data.aws_vpc.kolektor.cidr_block]
   }
 
   egress {
